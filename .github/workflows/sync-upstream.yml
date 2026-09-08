@@ -1,0 +1,151 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      target_commit:
+        description: 'Commit hash or tag (leave blank to use upstream/main)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/shuaiplus/NodeWarden.git || true
+          git fetch upstream --tags main
+
+      - name: Resolve target commit
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_INPUT: ${{ github.event.inputs.target_commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            LATEST_TAG="$(gh api repos/shuaiplus/NodeWarden/releases/latest --jq '.tag_name')"
+            if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+              echo "::error::No upstream release found."
+              exit 1
+            fi
+
+            TARGET_SHA="$(git rev-list -n 1 "$LATEST_TAG" 2>/dev/null || true)"
+            if [ -z "$TARGET_SHA" ]; then
+              echo "::error::Tag '$LATEST_TAG' was not fetched."
+              exit 1
+            fi
+
+            echo "mode=auto" >> "$GITHUB_OUTPUT"
+            echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          elif [ -n "$MANUAL_INPUT" ]; then
+            TARGET_SHA="$(git rev-parse "$MANUAL_INPUT^{commit}" 2>/dev/null || true)"
+            if [ -z "$TARGET_SHA" ]; then
+              echo "::error::Cannot resolve '$MANUAL_INPUT' to a commit."
+              exit 1
+            fi
+            echo "mode=manual" >> "$GITHUB_OUTPUT"
+          else
+            TARGET_SHA="$(git rev-parse upstream/main)"
+            echo "mode=manual" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          echo "Target commit: $TARGET_SHA"
+
+      - name: Check if update is needed
+        id: check
+        env:
+          TARGET_SHA: ${{ steps.resolve.outputs.target_sha }}
+          MODE: ${{ steps.resolve.outputs.mode }}
+        run: |
+          if [ "$MODE" = "manual" ]; then
+            CURRENT_SHA="$(git rev-parse HEAD)"
+            if [ "$CURRENT_SHA" = "$TARGET_SHA" ]; then
+              echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            fi
+          elif git merge-base --is-ancestor "$TARGET_SHA" HEAD 2>/dev/null; then
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply update while preserving fork workflows
+        if: steps.check.outputs.needs_update == 'true'
+        env:
+          TARGET_SHA: ${{ steps.resolve.outputs.target_sha }}
+          MODE: ${{ steps.resolve.outputs.mode }}
+        run: |
+          BEFORE_SHA="$(git rev-parse HEAD)"
+
+          if [ "$MODE" = "manual" ]; then
+            # Manual mode intentionally supports upgrade/rollback to an exact
+            # upstream commit. Restore this fork's workflows afterwards.
+            git reset --hard "$TARGET_SHA"
+            git rm -r -f --ignore-unmatch .github/workflows >/dev/null 2>&1 || true
+            git checkout "$BEFORE_SHA" -- .github/workflows
+            git add -A .github/workflows
+            git commit -m "chore: preserve fork workflows" || true
+            git push origin HEAD:main --force-with-lease
+            exit 0
+          fi
+
+          # Scheduled mode keeps upstream history with a real merge commit.
+          # The upstream deleted sync-upstream.yml while this fork modified it,
+          # so merge first without committing, then resolve every workflow-path
+          # conflict by restoring the fork's pre-sync workflow tree.
+          set +e
+          git merge "$TARGET_SHA" --no-commit --no-ff
+          MERGE_STATUS=$?
+          set -e
+
+          git rm -r -f --ignore-unmatch .github/workflows >/dev/null 2>&1 || true
+          git checkout "$BEFORE_SHA" -- .github/workflows
+          git add -A .github/workflows
+
+          UNMERGED="$(git diff --name-only --diff-filter=U)"
+          if [ -n "$UNMERGED" ]; then
+            echo "::error::Upstream merge has non-workflow conflicts:"
+            echo "$UNMERGED"
+            git merge --abort || true
+            exit 1
+          fi
+
+          if [ ! -f .git/MERGE_HEAD ]; then
+            echo "::error::git merge failed before creating a merge state (status $MERGE_STATUS)."
+            exit 1
+          fi
+
+          git commit -m "chore: sync upstream release ${{ steps.resolve.outputs.latest_tag }}"
+          git push origin HEAD:main
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check.outputs.needs_update }}" = "true" ]; then
+            echo "### Synced successfully" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Mode: ${{ steps.resolve.outputs.mode }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Tag: ${{ steps.resolve.outputs.latest_tag || 'N/A (manual)' }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Commit: \`${{ steps.resolve.outputs.target_sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Fork workflow files were preserved." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Nothing to update" >> "$GITHUB_STEP_SUMMARY"
+          fi
